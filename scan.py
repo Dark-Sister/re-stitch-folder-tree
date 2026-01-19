@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Offline-first data discovery + user correlation tool.
+LLM-driven data discovery + user correlation tool (OpenAI-compatible).
 
 What it does:
 - Walks a folder tree
 - Extracts content + metadata (txt/log/md/csv/json, pdf, docx)
-- Correlates each file to a provided users list (JSON array)
+- Clusters files and uses an LLM to correlate clusters/files to a provided users list (JSON array)
 - Writes streaming results to NDJSON + a compact summary JSON
 - Uses a SQLite cache to speed up rescans
 
 Notes:
-- LLM connector stub is included but commented out (OpenAI-compatible).
+- Requires an OpenAI-compatible endpoint + API key to perform attribution.
 """
 
 from __future__ import annotations
@@ -51,7 +51,7 @@ TEXT_EXTS = {".txt", ".log", ".md", ".csv", ".json"}
 PDF_EXTS = {".pdf"}
 DOCX_EXTS = {".docx"}
 
-EXTRACTOR_VERSION = "v1.1"
+EXTRACTOR_VERSION = "v2.0-llm"
 
 DEFAULT_EXCLUDE_DIR_GLOBS = [
     ".git",
@@ -229,6 +229,17 @@ class UserIndex:
         if uid is None:
             return []
         return list(self.uid_to_userids.get(int(uid), []))
+
+    def describe_user_min(self, userid: str) -> Dict[str, Any]:
+        u = self.users_by_userid[userid]
+        return {
+            "userid": u.userid,
+            "email": u.email,
+            "full_name": u.full_name,
+            "aliases": u.aliases[:3],
+            "usernames": u.usernames[:3],
+            "other_emails": u.other_emails[:3],
+        }
 
 
 def load_users(users_path: Path) -> List[UserRecord]:
@@ -711,8 +722,26 @@ def orphan_cluster_key(meta: Dict[str, Any], preview: str, relpath: str) -> Tupl
     return signals, cluster_id
 
 
+def tokens_from_cluster_signals(signals: Sequence[str]) -> List[str]:
+    """
+    Expand cluster signals like "email:foo@bar" into matchable tokens.
+    """
+    tokens: List[str] = []
+    for s in signals:
+        if not s:
+            continue
+        if ":" in s:
+            prefix, _, val = s.partition(":")
+            if prefix == "email" and val:
+                tokens.append(val)
+            if val:
+                tokens.extend(atomic_tokens(val))
+        tokens.extend(atomic_tokens(s))
+    return tokens
+
+
 def parse_args(argv: Sequence[str]) -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="GenAI-ish offline data discovery + correlation tool (v1).")
+    p = argparse.ArgumentParser(description="LLM-driven data discovery + correlation tool (OpenAI-compatible).")
     p.add_argument("--root", required=True, help="Root folder to scan")
     p.add_argument("--users", required=True, help="Users JSON array (see samples/users.sample.json)")
     p.add_argument("--outdir", default="outputs", help="Output directory (default: outputs)")
@@ -734,18 +763,157 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     p.add_argument("--exclude-dir-glob", action="append", default=[], help="Exclude directories by glob (repeatable)")
     p.add_argument("--exclude-path-glob", action="append", default=[], help="Exclude paths by glob (repeatable, relative to root)")
 
+    # LLM configuration (required for attribution)
+    p.add_argument("--llm-endpoint", default="https://api.openai.com/v1/chat/completions", help="OpenAI-compatible chat completions endpoint")
+    p.add_argument("--llm-model", default="gpt-4o-mini", help="Model name")
+    p.add_argument("--llm-api-key", default=os.environ.get("OPENAI_API_KEY", ""), help="API key (or set OPENAI_API_KEY)")
+    p.add_argument("--llm-timeout-seconds", type=int, default=60, help="HTTP timeout for LLM requests")
+    p.add_argument("--llm-max-candidates", type=int, default=50, help="Max candidate users to include in the LLM prompt per cluster")
+    p.add_argument("--llm-max-clusters", type=int, default=5000, help="Safety cap on number of clusters to label per run")
+    p.add_argument("--llm-dry-run", action="store_true", help="Do not call LLM; write clusters only (for debugging)")
+    p.add_argument("--llm-no-response-format", action="store_true", help="Disable OpenAI JSON response_format for compatibility")
+
     return p.parse_args(argv)
 
 
-# --- LLM connector stub (commented out on purpose) ---
-#
-# def llm_cluster_labels_openai_compatible(endpoint: str, api_key: str, clusters: List[Dict[str, Any]]) -> None:
-#     """
-#     Optional future feature: send cluster signals/snippets to an OpenAI-compatible endpoint
-#     and receive human-friendly cluster labels.
-#     Keep disabled by default for privacy.
-#     """
-#     raise NotImplementedError
+def iter_manifest(manifest_path: Path) -> Iterable[Path]:
+    with manifest_path.open("r", encoding="utf-8") as f:
+        for line in f:
+            p = line.strip()
+            if p:
+                yield Path(p)
+
+def _http_post_json(url: str, headers: Dict[str, str], payload: Dict[str, Any], timeout_s: int) -> Dict[str, Any]:
+    import urllib.request
+    import urllib.error
+
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(url=url, data=data, method="POST")
+    for k, v in headers.items():
+        req.add_header(k, v)
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_s) as resp:
+            body = resp.read().decode("utf-8", errors="replace")
+            return json.loads(body)
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        raise RuntimeError(f"HTTP {e.code} calling LLM endpoint: {body[:2000]}") from e
+
+
+def llm_label_cluster_openai_compatible(
+    *,
+    endpoint: str,
+    api_key: str,
+    model: str,
+    timeout_s: int,
+    min_confidence: float,
+    users: List[Dict[str, Any]],
+    allowed_userids: Sequence[str],
+    cluster: Dict[str, Any],
+    disable_response_format: bool = False,
+) -> Dict[str, Any]:
+    """
+    Ask LLM to label a cluster with best_userid/confidence/notes.
+    """
+    system = (
+        "You are a cybersecurity data-attribution assistant. "
+        "Given a cluster of files and a list of candidate users, decide which user likely owns the data. "
+        "Return STRICT JSON only (no markdown) following the provided schema."
+    )
+
+    schema = {
+        "best_userid": "string | null",
+        "confidence": "number (0..1)",
+        "notes": ["string", "string"],
+        "guaranteed": "boolean",
+    }
+
+    user = (
+        "Task:\n"
+        "- Choose best_userid from the provided users list OR null.\n"
+        "- Provide confidence 0..1.\n"
+        f"- Set guaranteed=true iff confidence >= {min_confidence:.2f}.\n"
+        "- notes must cite specific evidence (emails, usernames, author fields, repeated tokens, path patterns).\n"
+        "- Output MUST be strict JSON with keys: best_userid, confidence, guaranteed, notes.\n"
+        "\n"
+        f"JSON schema example:\n{json.dumps(schema, indent=2)}\n"
+        "\n"
+        f"Candidate users:\n{json.dumps(users, ensure_ascii=False)}\n"
+        "\n"
+        f"Cluster:\n{json.dumps(cluster, ensure_ascii=False)}\n"
+    )
+
+    payload = {
+        "model": model,
+        "temperature": 0.0,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    if not disable_response_format:
+        payload["response_format"] = {"type": "json_object"}
+
+    headers = {"Authorization": f"Bearer {api_key}"}
+    try:
+        resp = _http_post_json(endpoint, headers=headers, payload=payload, timeout_s=timeout_s)
+    except RuntimeError as e:
+        # Some OpenAI-compatible endpoints reject response_format; retry without it.
+        if not disable_response_format and "response_format" in str(e):
+            payload.pop("response_format", None)
+            resp = _http_post_json(endpoint, headers=headers, payload=payload, timeout_s=timeout_s)
+        else:
+            raise
+    # OpenAI-compatible shape: choices[0].message.content
+    content = (
+        (resp.get("choices") or [{}])[0]
+        .get("message", {})
+        .get("content", "")
+    )
+    if not content:
+        raise RuntimeError(f"LLM returned empty content: {resp}")
+    try:
+        out = json.loads(content)
+    except Exception:
+        # Best-effort: extract first JSON object from the response
+        m = re.search(r"\{.*\}", content, re.DOTALL)
+        if m:
+            try:
+                out = json.loads(m.group(0))
+            except Exception as e:
+                raise RuntimeError(f"LLM did not return valid JSON. content={content[:2000]}") from e
+        else:
+            raise RuntimeError(f"LLM did not return valid JSON. content={content[:2000]}")
+
+    best_userid = out.get("best_userid")
+    if best_userid is not None and not isinstance(best_userid, str):
+        best_userid = None
+    if best_userid is not None and best_userid not in allowed_userids:
+        best_userid = None
+    try:
+        conf = float(out.get("confidence", 0.0) or 0.0)
+    except Exception:
+        conf = 0.0
+    conf = max(0.0, min(1.0, conf))
+    guaranteed = bool(out.get("guaranteed", conf >= min_confidence))
+    notes = out.get("notes") or []
+    if not isinstance(notes, list):
+        notes = [str(notes)]
+    notes = [str(x) for x in notes][:12]
+    if best_userid is None:
+        guaranteed = False
+    return {
+        "best_userid": best_userid,
+        "confidence": round(conf, 4),
+        "guaranteed": guaranteed,
+        "notes": notes,
+        "raw": out,
+    }
 
 
 def main(argv: Sequence[str]) -> int:
@@ -760,6 +928,15 @@ def main(argv: Sequence[str]) -> int:
     if int(args.match_chars) <= 0:
         print("ERROR: --match-chars must be > 0", file=sys.stderr)
         return 2
+    if int(args.llm_max_candidates) <= 0:
+        print("ERROR: --llm-max-candidates must be > 0", file=sys.stderr)
+        return 2
+    if int(args.llm_max_clusters) <= 0:
+        print("ERROR: --llm-max-clusters must be > 0", file=sys.stderr)
+        return 2
+    if not args.llm_dry_run and not args.llm_api_key:
+        print("ERROR: LLM is required. Provide --llm-api-key or set OPENAI_API_KEY (or use --llm-dry-run).", file=sys.stderr)
+        return 2
 
     root = Path(args.root).expanduser().resolve()
     users_path = Path(args.users).expanduser().resolve()
@@ -767,6 +944,9 @@ def main(argv: Sequence[str]) -> int:
     outdir.mkdir(parents=True, exist_ok=True)
 
     users = load_users(users_path)
+    if not users:
+        print("ERROR: users.json is empty; provide at least one user record.", file=sys.stderr)
+        return 2
     uindex = UserIndex(users)
 
     # Cache invalidation key (when extraction-relevant settings change)
@@ -789,6 +969,8 @@ def main(argv: Sequence[str]) -> int:
 
     findings_path = outdir / "findings.ndjson"
     summary_path = outdir / "summary.json"
+    cluster_labels_path = outdir / "cluster_labels.json"
+    manifest_path = outdir / "file_manifest.txt"
 
     exclude_dir_globs = DEFAULT_EXCLUDE_DIR_GLOBS + list(args.exclude_dir_glob or [])
     exclude_path_globs = DEFAULT_EXCLUDE_PATH_GLOBS + list(args.exclude_path_glob or [])
@@ -796,18 +978,18 @@ def main(argv: Sequence[str]) -> int:
     run_started = time.time()
 
     # Aggregates for summary
-    user_stats: Dict[str, Dict[str, Any]] = {}
-    orphan_records: List[Dict[str, Any]] = []
     counts = Counter()
 
-    # For segmentation
-    orphan_relpaths: List[str] = []
-    orphan_sizes: List[int] = []
+    # Cluster aggregates built during scan
+    clusters: Dict[str, Dict[str, Any]] = {}
 
-    # Write findings streaming
-    with findings_path.open("w", encoding="utf-8") as fout:
-        all_files = list(iter_files(root, exclude_dir_globs, exclude_path_globs, args.follow_symlinks))
-        for path in tqdm(all_files, desc="Scanning files"):
+    # Scan phase: extract + cache; build clusters (no attribution yet)
+    with manifest_path.open("w", encoding="utf-8") as mf:
+        for path in tqdm(
+            iter_files(root, exclude_dir_globs, exclude_path_globs, args.follow_symlinks),
+            desc="Scanning files",
+        ):
+            mf.write(str(path) + "\n")
             ext = path.suffix.lower()
             relpath = safe_relpath(path, root)
             abs_path = str(path.resolve())
@@ -858,61 +1040,205 @@ def main(argv: Sequence[str]) -> int:
                 )
                 used_cache = False
 
-            # Candidate tokens for narrowing candidates (fast)
-            tokens, _token_notes = extract_candidate_tokens(path, relpath, match_text, meta)
-            candidate_userids = set(uindex.candidate_userids_from_tokens(tokens))
-            # Add UID-derived candidates (helps when text has no obvious tokens but ownership is stable)
-            try:
-                candidate_userids.update(uindex.candidate_userids_from_uid(getattr(st, "st_uid", None)))
-            except Exception:
-                pass
-            candidate_userids = sorted(candidate_userids)
+            # Cluster key for later attribution
+            signals, cluster_id = orphan_cluster_key(meta, match_text, relpath)
+            c = clusters.setdefault(
+                cluster_id,
+                {
+                    "cluster_id": cluster_id,
+                    "signals": signals,
+                    "file_count": 0,
+                    "total_bytes": 0,
+                    "sample_files": [],
+                    "sample_texts": [],
+                    "relpaths": [],
+                    "sizes": [],
+                },
+            )
+            c["file_count"] += 1
+            c["total_bytes"] += size
+            if len(c["sample_files"]) < 10:
+                c["sample_files"].append({"relpath": relpath, "size": size, "kind": kind})
+            if match_text and len(c["sample_texts"]) < 3:
+                c["sample_texts"].append(match_text[:2000])
+            c["relpaths"].append(relpath)
+            c["sizes"].append(size)
 
-            # Score candidates; if none, still attempt weak scoring against all users? That would be expensive.
-            # We keep it tight by only scoring candidates derived from tokens. For v1, this is acceptable.
-            best_userid: Optional[str] = None
-            best_conf = 0.0
-            best_notes: List[str] = []
-            candidates_out: List[Dict[str, Any]] = []
+            counts["files_seen"] += 1
+            if used_cache:
+                counts["cache_hits"] += 1
 
-            for uid in candidate_userids[:200]:  # safety bound; token collisions can create big fanouts
-                user = uindex.users_by_userid[uid]
-                conf, notes, evid = score_user_for_file(
-                    user,
-                    abs_path=abs_path,
-                    relpath=relpath,
-                    text=match_text,
-                    meta=meta,
-                    st=st,
-                )
-                if conf > 0:
-                    candidates_out.append(
-                        {
-                            "userid": uid,
-                            "confidence": round(conf, 4),
-                            "evidence": {k: round(v, 3) for k, v in sorted(evid.items(), key=lambda kv: kv[1], reverse=True)},
-                        }
-                    )
-                if conf > best_conf:
-                    best_conf = conf
-                    best_userid = uid
-                    best_notes = notes
+    conn.commit()
+    conn.close()
 
-            candidates_out = sorted(candidates_out, key=lambda x: x["confidence"], reverse=True)[:5]
+    # Prepare clusters for labeling
+    cluster_list = list(clusters.values())
+    for c in cluster_list:
+        c["folder_segments"] = topk_folder_tree(c["relpaths"], c["sizes"], max_levels=3, topk=3)
+        c.pop("relpaths", None)
+        c.pop("sizes", None)
 
-            status = "orphan"
-            match_obj: Dict[str, Any] = {
-                "best_userid": None,
-                "confidence": round(best_conf, 4),
-                "notes": [],
-                "candidates": candidates_out,
+    cluster_list = sorted(cluster_list, key=lambda x: (x["file_count"], x["total_bytes"]), reverse=True)
+    if len(cluster_list) > int(args.llm_max_clusters):
+        cluster_list = cluster_list[: int(args.llm_max_clusters)]
+
+    # Label clusters using LLM
+    labels_by_cluster: Dict[str, Dict[str, Any]] = {}
+    if args.llm_dry_run:
+        for c in cluster_list:
+            labels_by_cluster[c["cluster_id"]] = {"best_userid": None, "confidence": 0.0, "guaranteed": False, "notes": ["llm-dry-run"], "raw": {}}
+    else:
+        for c in tqdm(cluster_list, desc="LLM labeling clusters"):
+            # Skip LLM if there is no usable evidence
+            has_signals = bool(c.get("signals"))
+            has_text = bool(c.get("sample_texts"))
+            if not has_signals and not has_text:
+                labels_by_cluster[c["cluster_id"]] = {
+                    "best_userid": None,
+                    "confidence": 0.0,
+                    "guaranteed": False,
+                    "notes": ["no evidence to attribute"],
+                    "raw": {},
+                }
+                counts["clusters_labeled"] += 1
+                continue
+
+            # Build candidate list from signals + sample texts (keeps prompt small)
+            candidate_tokens: List[str] = []
+            candidate_tokens.extend(tokens_from_cluster_signals(c.get("signals") or []))
+            for t in c.get("sample_texts") or []:
+                candidate_tokens.extend(atomic_tokens(t)[:2000])
+                candidate_tokens.extend(EMAIL_RE.findall(t)[:20])
+            for sf in c.get("sample_files") or []:
+                candidate_tokens.extend(atomic_tokens(sf.get("relpath", "")))
+
+            cands = uindex.candidate_userids_from_tokens(candidate_tokens)
+            if not cands:
+                labels_by_cluster[c["cluster_id"]] = {
+                    "best_userid": None,
+                    "confidence": 0.0,
+                    "guaranteed": False,
+                    "notes": ["no candidate users from signals/text; skipped LLM"],
+                    "raw": {},
+                }
+                counts["clusters_labeled"] += 1
+                continue
+
+            cands = cands[: int(args.llm_max_candidates)]
+            users_min = [uindex.describe_user_min(uid) for uid in cands]
+
+            cluster_prompt_obj = {
+                "cluster_id": c["cluster_id"],
+                "signals": c.get("signals") or [],
+                "sample_files": c.get("sample_files") or [],
+                "sample_texts": c.get("sample_texts") or [],
+                "folder_segments": c.get("folder_segments") or [],
             }
-            if best_userid and best_conf >= float(args.min_confidence):
-                status = "linked"
-                match_obj["best_userid"] = best_userid
-                match_obj["notes"] = best_notes[:12]
+            try:
+                label = llm_label_cluster_openai_compatible(
+                    endpoint=args.llm_endpoint,
+                    api_key=args.llm_api_key,
+                    model=args.llm_model,
+                    timeout_s=int(args.llm_timeout_seconds),
+                    min_confidence=float(args.min_confidence),
+                    users=users_min,
+                    allowed_userids=cands,
+                    cluster=cluster_prompt_obj,
+                    disable_response_format=bool(args.llm_no_response_format),
+                )
+                labels_by_cluster[c["cluster_id"]] = label
+                counts["clusters_labeled"] += 1
+            except Exception as e:
+                labels_by_cluster[c["cluster_id"]] = {
+                    "best_userid": None,
+                    "confidence": 0.0,
+                    "guaranteed": False,
+                    "notes": [f"llm_error: {type(e).__name__}: {e}"],
+                    "raw": {},
+                }
+                counts["clusters_label_errors"] += 1
 
-                # Update user stats
+    # Write labels for inspection
+    with cluster_labels_path.open("w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "run": {
+                    "root": str(root),
+                    "users": str(users_path),
+                    "endpoint": args.llm_endpoint,
+                    "model": args.llm_model,
+                    "min_confidence": float(args.min_confidence),
+                    "config_hash": config_hash,
+                    "extractor_version": EXTRACTOR_VERSION,
+                    "finished_utc": utc_now_iso(),
+                },
+                "labels_by_cluster": labels_by_cluster,
+            },
+            f,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+    # Second pass: emit per-file findings with cluster label applied
+    conn = init_cache(cache_path)
+    user_stats: Dict[str, Dict[str, Any]] = {}
+    orphan_relpaths: List[str] = []
+    orphan_sizes: List[int] = []
+
+    with findings_path.open("w", encoding="utf-8") as fout:
+        for path in tqdm(iter_manifest(manifest_path), desc="Writing findings"):
+            st = file_stat(path, follow_symlinks=args.follow_symlinks)
+            if st is None:
+                continue
+            size = int(getattr(st, "st_size", 0) or 0)
+            mtime_ns = int(getattr(st, "st_mtime_ns", int(st.st_mtime * 1e9)))
+            ext = path.suffix.lower()
+            relpath = safe_relpath(path, root)
+
+            cached = cache_get(conn, str(path)) or {}
+            meta = cached.get("meta") or {}
+            kind = cached.get("kind") or meta.get("kind") or "unknown"
+            match_text = cached.get("match_text") or ""
+            preview = cached.get("text_preview") or ""
+
+            # If cache is stale or missing, re-extract to keep cluster_id consistent
+            if (
+                not cached
+                or (cached.get("config_hash") or "") != config_hash
+                or int(cached.get("mtime_ns") or -1) != mtime_ns
+                or int(cached.get("size") or -1) != size
+            ):
+                text, meta = extract_content_and_meta(
+                    path,
+                    ext=ext,
+                    max_bytes=args.max_bytes,
+                    max_text_chars=args.max_text_chars,
+                )
+                kind = meta.get("kind", "unknown")
+                match_text = (text or "")[: int(args.match_chars)]
+                preview = build_file_preview(text, raw_mode=args.raw_mode, snippet_chars=args.snippet_chars)
+                text_hash = sha256_text(preview) if preview else ""
+                cache_put(
+                    conn,
+                    path=str(path),
+                    mtime_ns=mtime_ns,
+                    size=size,
+                    kind=kind,
+                    meta=meta,
+                    match_text=match_text,
+                    text_preview=preview,
+                    text_hash=text_hash,
+                    config_hash=config_hash,
+                )
+
+            signals, cluster_id = orphan_cluster_key(meta, match_text, relpath)
+            label = labels_by_cluster.get(cluster_id) or {"best_userid": None, "confidence": 0.0, "guaranteed": False, "notes": ["cluster not labeled"]}
+
+            best_userid = label.get("best_userid")
+            conf = float(label.get("confidence", 0.0) or 0.0)
+            status = "orphan"
+            if best_userid and conf >= float(args.min_confidence):
+                status = "linked"
                 us = user_stats.setdefault(
                     best_userid,
                     {"file_count": 0, "total_bytes": 0, "files": [], "notes_samples": []},
@@ -924,84 +1250,59 @@ def main(argv: Sequence[str]) -> int:
                         {
                             "relpath": relpath,
                             "size": size,
-                            "kind": meta.get("kind", "unknown"),
-                            "confidence": round(best_conf, 4),
-                            "notes": best_notes[:8],
+                            "kind": kind,
+                            "confidence": round(conf, 4),
+                            "notes": (label.get("notes") or [])[:8],
                         }
                     )
-                if best_notes and len(us["notes_samples"]) < 25:
-                    us["notes_samples"].append(best_notes[0])
+                if label.get("notes") and len(us["notes_samples"]) < 25:
+                    us["notes_samples"].append((label.get("notes") or [""])[0])
                 counts["linked"] += 1
             else:
-                # Orphan record (for clustering + segmentation)
-                signals, cluster_id = orphan_cluster_key(meta, match_text, relpath)
-                orphan_records.append(
-                    {
-                        "relpath": relpath,
-                        "size": size,
-                        "kind": meta.get("kind", "unknown"),
-                        "cluster_id": cluster_id,
-                        "signals": signals,
-                    }
-                )
                 orphan_relpaths.append(relpath)
                 orphan_sizes.append(size)
                 counts["orphan"] += 1
 
-            # Emit per-file finding
             finding = {
                 "path": str(path),
                 "relpath": relpath,
                 "size": size,
                 "mtime_ns": mtime_ns,
                 "ext": ext,
-                "used_cache": used_cache,
-                "extract": {
-                    "kind": meta.get("kind", "unknown"),
-                    "meta": meta,
-                    "raw": preview,
+                "extract": {"kind": kind, "meta": meta, "raw": preview},
+                "cluster": {"cluster_id": cluster_id, "signals": signals},
+                "match": {
+                    "best_userid": best_userid,
+                    "confidence": round(conf, 4),
+                    "notes": (label.get("notes") or [])[:12],
+                    "guaranteed": bool(label.get("guaranteed", conf >= float(args.min_confidence))),
                 },
-                "match": match_obj,
                 "status": status,
             }
             fout.write(json.dumps(finding, ensure_ascii=False) + "\n")
 
-    conn.commit()
     conn.close()
 
-    # Cluster orphans
-    clusters: Dict[str, Dict[str, Any]] = {}
-    for rec in orphan_records:
-        cid = rec["cluster_id"]
-        c = clusters.setdefault(
-            cid,
+    # Summarize clusters (bounded)
+    cluster_rollup = []
+    for c in cluster_list[:500]:
+        cid = c["cluster_id"]
+        lab = labels_by_cluster.get(cid) or {}
+        cluster_rollup.append(
             {
                 "cluster_id": cid,
-                "signals": rec["signals"],
-                "file_count": 0,
-                "total_bytes": 0,
-                "sample_files": [],
-                "relpaths": [],
-                "sizes": [],
-            },
+                "signals": c.get("signals") or [],
+                "file_count": c.get("file_count", 0),
+                "total_bytes": c.get("total_bytes", 0),
+                "folder_segments": c.get("folder_segments") or [],
+                "label": {
+                    "best_userid": lab.get("best_userid"),
+                    "confidence": lab.get("confidence"),
+                    "notes": (lab.get("notes") or [])[:6],
+                },
+                "sample_files": c.get("sample_files") or [],
+            }
         )
-        c["file_count"] += 1
-        c["total_bytes"] += int(rec["size"])
-        if len(c["sample_files"]) < 10:
-            c["sample_files"].append(
-                {"relpath": rec["relpath"], "size": rec["size"], "kind": rec["kind"]}
-            )
-        c["relpaths"].append(rec["relpath"])
-        c["sizes"].append(int(rec["size"]))
-
-    cluster_list = list(clusters.values())
-    for c in cluster_list:
-        c["folder_segments"] = topk_folder_tree(c["relpaths"], c["sizes"], max_levels=3, topk=3)
-        # drop heavy lists
-        c.pop("relpaths", None)
-        c.pop("sizes", None)
-
-    cluster_list = sorted(cluster_list, key=lambda x: (x["file_count"], x["total_bytes"]), reverse=True)
 
     summary = {
         "run": {
@@ -1020,13 +1321,21 @@ def main(argv: Sequence[str]) -> int:
             "follow_symlinks": bool(args.follow_symlinks),
             "exclude_dir_globs": exclude_dir_globs,
             "exclude_path_globs": exclude_path_globs,
+            "llm": {
+                "endpoint": args.llm_endpoint,
+                "model": args.llm_model,
+                "max_candidates": int(args.llm_max_candidates),
+                "max_clusters": int(args.llm_max_clusters),
+                "dry_run": bool(args.llm_dry_run),
+                "no_response_format": bool(args.llm_no_response_format),
+            },
         },
         "counts": dict(counts),
         "users": user_stats,
         "orphans": {
             "file_count": int(counts.get("orphan", 0)),
             "total_bytes": int(sum(orphan_sizes)),
-            "clusters": cluster_list[:500],  # keep summary bounded
+            "clusters": cluster_rollup,
             "folder_segments": topk_folder_tree(orphan_relpaths, orphan_sizes, max_levels=3, topk=3),
         },
     }
@@ -1034,10 +1343,11 @@ def main(argv: Sequence[str]) -> int:
     with summary_path.open("w", encoding="utf-8") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
-    print(f"Wrote findings: {findings_path}")
-    print(f"Wrote summary:  {summary_path}")
-    print(f"Cache:          {cache_path}")
-    print(f"Counts:         {dict(counts)}")
+    print(f"Wrote findings:       {findings_path}")
+    print(f"Wrote cluster labels: {cluster_labels_path}")
+    print(f"Wrote summary:        {summary_path}")
+    print(f"Cache:               {cache_path}")
+    print(f"Counts:              {dict(counts)}")
     return 0
 
 
