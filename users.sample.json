@@ -1,0 +1,13 @@
+[
+  {
+    "userid": "AB334",
+    "email": "ab334@company.com",
+    "full_name": "Alex Brown",
+    "dob": "1990-01-15",
+    "uid": 102334,
+    "aliases": ["A. Brown", "Alex J Brown"],
+    "other_emails": ["alex.brown@company.com"],
+    "usernames": ["ab334", "alexb"],
+    "home_dirs": ["/Users/ab334", "/home/ab334"]
+  }
+]
